@@ -1,0 +1,66 @@
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# ----------------------
+# Data & datasets
+# ----------------------
+data/
+*.pt
+*.pth
+*.npz
+*.npy
+*.gz
+
+# ----------------------
+# Experiment outputs
+# ----------------------
+results/
+results_eafl/
+*.csv
+*.log
+*.txt
+
+# If you want to KEEP summary CSVs for paper, comment above and use:
+# !results_csv_phase_b/*summary.csv
+
+# ----------------------
+# Checkpoints / models
+# ----------------------
+checkpoints/
+*.ckpt
+
+# ----------------------
+# Jupyter / temp
+# ----------------------
+.ipynb_checkpoints/
+
+# ----------------------
+# IDE / Editor
+# ----------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ----------------------
+# OS files
+# ----------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# Misc
+# ----------------------
+*.tmp
+*.bak
