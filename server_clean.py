@@ -291,6 +291,7 @@ class Server:
         -------
         (accuracy_percent, avg_cross_entropy_loss)
         """
+        print(f"[Evaluation] Evaluating global model at round {self.global_round}")
         self.global_model.eval()
         criterion = torch.nn.CrossEntropyLoss()
         total, correct, loss_sum = 0, 0, 0.0

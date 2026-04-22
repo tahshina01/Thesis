@@ -511,31 +511,23 @@ class EAFLRunner:
 
         # ── State tracking ─────────────────────────────────────────────────
         # last_participation_round[cid]: round t' when client cid last
-        #   participated in an intra-cluster SAA.  -1 means never participated.
+        #   participated in an intra-cluster SAA.  Used to compute τ_i = t - t'.
         last_participation_round = [-1] * cfg.num_clients
 
-        # model_history[k]: global model parameters AFTER round k-1 (i.e. the
-        #   model available at the START of round k).  Key 0 is the initial
-        #   model before any training.  Key t+1 is stored after round t.
-        #   Clients with last_received_round = k train from model_history[k].
-        MODEL_HISTORY_WINDOW = cfg.r_clustering + 50
-        model_history = {0: clone_state(self.server.global_model.state_dict())}
+        # last_received_round[cid]: round whose model state the client currently holds.
+        #   Non-participants keep their old value; participants get updated to t.
+        last_received_round = [-1] * cfg.num_clients
 
-        # last_received_round default = 0 so all clients start from model_history[0]
-        # (the initial global model).  Participants get updated to t+1 after round t.
-        last_received_round = [0] * cfg.num_clients
+        # model_history[t]: global model parameters after round t.
+        #   Clients whose last_received_round = t' train from model_history[t'].
+        #   We keep a sliding window to bound memory. otherwise too much load on ram.
+        MODEL_HISTORY_WINDOW = cfg.r_clustering+50
+        model_history = {0: clone_state(self.server.global_model.state_dict())}
 
         # GDC outputs (initialised to None; set on first clustering round)
         cluster_members:    Optional[dict] = None
         cluster_heads:      Optional[dict] = None
         cluster_data_sizes: Optional[dict] = None
-
-        # client_local_states[cid]: the client's CURRENT local model weights.
-        # This is distinct from model_history (which stores global snapshots).
-        # Non-participants keep accumulating local drift here round-over-round;
-        # participants have their entry overwritten with the new global after DSA.
-        # Seeded lazily on first access inside the SAA loop.
-        client_local_states: Dict[int, dict] = {}
 
         # One stateful RNG for all timing draws — must live outside the loop
         # so jitter advances continuously and is not reset each round.
@@ -574,36 +566,34 @@ class EAFLRunner:
                 #     print(f"is clustering round: last_participation_round={last_participation_round[cid]}")
                 
                 for cid in range(cfg.num_clients):
-                    # For GDC gradient collection, train from the client's current
-                    # local state (same as SAA stage would).  This ensures the
-                    # clustering gradients reflect genuine local distributions.
-                    if cid not in client_local_states:
-                        init_round = max(0, last_received_round[cid])
-                        client_local_states[cid] = clone_state(
-                            model_history.get(
-                                init_round,
-                                model_history[min(model_history.keys())]
-                            )
-                        )
+                    # Client trains from its last-received model (possibly stale)
+                    model_round = max(0, last_received_round[cid])
+                    print(f"model_round for client {cid}: {model_round} (last_received_round={last_received_round[cid]})")
+                    base_state  = model_history.get(model_round,
+                                  model_history[max(model_history.keys())])
 
+                    # Build a temporary model to pass to client.train()
                     tmp_model = cfg.model_class(**cfg.model_args)
-                    tmp_model.load_state_dict(client_local_states[cid])
-                    print(f"Clustering: client {cid} training from local state "
-                          f"(last_received_round={last_received_round[cid]})")
+                    tmp_model.load_state_dict(base_state)
 
                     # train() returns (state_dict, pseudo_gradient, data_size)
-                    trained_state, grad, data_size = self.clients[cid].train(
+                    # We only need the gradient here (for GDC) and data_size
+                    _, grad, data_size = self.clients[cid].train(
                         tmp_model, epochs=cfg.epochs, learning_rate=cfg.client_lr
                     )
-                    del tmp_model
+                    del tmp_model  # free memory
                     gc.collect()
-
-                    # Persist the post-training state — client advanced during
-                    # clustering regardless of whether they'll be selected in SAA.
-                    client_local_states[cid] = clone_state(trained_state)
-
+                    
                     grads_list.append(grad)
                     data_sizes_list.append(data_size)
+
+                    # Estimate how long this client would take (for subsequent
+                    # intra-cluster top-k selection this same round)
+                    # client_times[cid] = estimate_completion_time(
+                    #     self.clients[cid], self.steps_by_client[cid],
+                    #     self.model_mb, cfg, timing_rng
+                    # )
+                    # print(f"Client {cid}: data_size={data_size}, estimated_time={client_times[cid]:.2f} sec")
 
                 # GDC: K-Means on cosine-normalised gradients (Section V-B)
                 cluster_start = time.perf_counter()
@@ -621,24 +611,12 @@ class EAFLRunner:
                 clustering_time = time.perf_counter() - cluster_start
 
                 
-            # ── SAA stage: select fastest φ·|X_n| clients per cluster ────────
-            # Design principle (the core correctness fix):
-            #
-            # Every client carries a persistent local model state (client_local_states).
-            # Between rounds, NON-participants are NOT reset to any global snapshot —
-            # their local state is whatever it was after their last training step.
-            # This means two clients with the same staleness τ will have diverged
-            # local models (trained on different data shards from different starting
-            # checkpoints), which is exactly the asynchronous semantics of the paper.
-            #
-            # Participants receive the new global model after DSA and their local
-            # state is overwritten with that new global, ready for the next round.
-            cluster_updates      = []
-            all_participants     = set()
-            staleness_values     = []
-            cluster_summary      = {}
+            # Select fastest φ·|X_n| clients per cluster and run SAA.
+            cluster_updates    = []
+            all_participants   = set()
+            staleness_values   = []
+            cluster_summary    = {}
             completion_times_sel = {}
-
             for cluster_id, members in cluster_members.items():
                 k = max(1, int(math.ceil(cfg.phi * len(members))))
                 member_times = {
@@ -650,60 +628,40 @@ class EAFLRunner:
                 }
 
                 # Select fastest φ·|X_n| clients by completion time
+                # This is the paper's "fastest K clients" rule, applied
+                # at cluster level rather than globally.
                 selected = sorted(members, key=lambda c: member_times[c])[:k]
                 for cid in selected:
                     completion_times_sel[cid] = member_times[cid]
-
+                print(f"Client {cid}: data_size={data_size}")
+                # head = cluster_heads[cluster_id]
+                # if head not in selected:
+                #     selected[-1] = head
+                #     selected = sorted(set(selected), key=lambda c: client_times[c])[:k]
+                
                 all_participants.update(selected)
-
-                # ── Train ALL members from their PERSISTENT local state ────────
-                # KEY CORRECTNESS POINT:
-                #   Each client trains from client_local_states[cid] — the model
-                #   they actually hold locally (possibly many rounds of local drift
-                #   away from the last global they received).  We do NOT re-load
-                #   from model_history[last_received_round]: that would erase all
-                #   accumulated local drift and make two clients with equal staleness
-                #   produce identical gradients (wrong).
-                #
-                #   We save the post-training local state back for EVERY member,
-                #   selected or not, because every member DID train this round.
-                member_updates = {}
-                for cid in members:
-                    # Lazy init: first time we see this client, seed from the
-                    # most recent global model they received.
-                    if cid not in client_local_states:
-                        init_round = max(0, last_received_round[cid])
-                        client_local_states[cid] = clone_state(
-                            model_history.get(
-                                init_round,
-                                model_history[min(model_history.keys())]
-                            )
-                        )
-
-                    tmp_model = cfg.model_class(**cfg.model_args)
-                    tmp_model.load_state_dict(client_local_states[cid])
-
-                    trained_state, grad, data_size = self.clients[cid].train(
-                        tmp_model, epochs=cfg.epochs, learning_rate=cfg.client_lr
-                    )
-                    del tmp_model
-                    gc.collect()
-
-                    # Persist the evolved local state (selected OR not)
-                    client_local_states[cid] = clone_state(trained_state)
-
-                    member_updates[cid] = {"grad": grad, "data_size": data_size}
-
-                # ── Build SAA update list from SELECTED clients only ───────────
+                
+                # Collect updates for SAA; gradients already computed above
                 updates = []
                 for cid in selected:
-                    grad      = member_updates[cid]["grad"]
-                    data_size = member_updates[cid]["data_size"]
+                    model_round = max(0, last_received_round[cid])
+                    base_state = model_history.get(
+                        model_round,
+                        model_history[max(model_history.keys())]
+                    )
 
+                    tmp_model = cfg.model_class(**cfg.model_args)
+                    tmp_model.load_state_dict(base_state)
+
+                    _, grad, data_size = self.clients[cid].train(
+                        tmp_model, epochs=cfg.epochs, learning_rate=cfg.client_lr
+                    )
+                    del tmp_model  # free memory
+                    gc.collect()
+                    
                     tau = (t - last_participation_round[cid]
-                           if last_participation_round[cid] >= 0 else t + 1)
-                    print(f"Client {cid}: staleness={tau} round {t} "
-                          f"last_participation_round={last_participation_round[cid]}")
+                            if last_participation_round[cid] >= 0 else t + 1)
+                    print(f"Client {cid}: staleness={tau} round {t} last_participation_round={last_participation_round[cid]}")
                     staleness_values.append(tau)
                     updates.append({
                         "grads":     grad,
@@ -758,23 +716,19 @@ class EAFLRunner:
             # ── Model delivery (Algorithm 1, lines 29-30) ─────────────────
             # New global model is sent ONLY to clients who participated in SAA
             # this round (via their cluster head).
-            # Non-participants keep their old last_received_round AND their
-            # locally-evolved client_local_states entry — they do NOT get reset.
+            # Non-participants keep their old last_received_round.
             new_state = clone_state(self.server.global_model.state_dict())
-            # Use t+1 as key: key 0 is permanently the initial pre-training model.
-            model_history[t + 1] = new_state
-            print(f"new model history saved at key {t+1}")
+            model_history[t] = new_state
+            print(f"new model history saved at {t+1}")
 
             for cid in all_participants:
                 last_participation_round[cid] = t   # τ reset for next round
-                last_received_round[cid]      = t + 1
-                # Overwrite local state with the fresh global model
-                client_local_states[cid]      = clone_state(new_state)
-                print(f"Participant {cid} updated to global model at round {t+1}")
+                last_received_round[cid]      = t   # client gets the new model
+                print(f"current round {t}")
 
-            # Prune old model history to bound memory (keep key 0 always)
+            # Prune old model history to bound memory
             old_key = (t + 1) - MODEL_HISTORY_WINDOW
-            print(f"pruning model history: removing key {old_key} if exists")
+            print(f"pruning model history: removing round {old_key} if exists")
             if old_key in model_history and old_key != 0:
                 del model_history[old_key]
 

@@ -58,6 +58,7 @@ import os
 import sys
 import random
 import time
+import gc
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -515,19 +516,19 @@ class EAFLRunner:
 
         # last_received_round[cid]: round whose model state the client currently holds.
         #   Non-participants keep their old value; participants get updated to t.
-        last_received_round = [-1] * cfg.num_clients
+        last_received_round = [0] * cfg.num_clients
 
         # model_history[t]: global model parameters after round t.
         #   Clients whose last_received_round = t' train from model_history[t'].
-        #   We keep a sliding window to bound memory.
-        MODEL_HISTORY_WINDOW = cfg.rounds
+        #   We keep a sliding window to bound memory. otherwise too much load on ram.
+        MODEL_HISTORY_WINDOW = cfg.r_clustering+50
         model_history = {0: clone_state(self.server.global_model.state_dict())}
 
         # GDC outputs (initialised to None; set on first clustering round)
         cluster_members:    Optional[dict] = None
         cluster_heads:      Optional[dict] = None
         cluster_data_sizes: Optional[dict] = None
-
+        client_local_states: Dict[int, dict] = {}
         # One stateful RNG for all timing draws — must live outside the loop
         # so jitter advances continuously and is not reset each round.
         timing_rng = np.random.default_rng(cfg.seed + 77)
@@ -580,16 +581,19 @@ class EAFLRunner:
                     _, grad, data_size = self.clients[cid].train(
                         tmp_model, epochs=cfg.epochs, learning_rate=cfg.client_lr
                     )
+                    del tmp_model  # free memory
+                    gc.collect()
+                    
                     grads_list.append(grad)
                     data_sizes_list.append(data_size)
 
                     # Estimate how long this client would take (for subsequent
                     # intra-cluster top-k selection this same round)
-                    client_times[cid] = estimate_completion_time(
-                        self.clients[cid], self.steps_by_client[cid],
-                        self.model_mb, cfg, timing_rng
-                    )
-                    print(f"Client {cid}: data_size={data_size}, estimated_time={client_times[cid]:.2f} sec")
+                    # client_times[cid] = estimate_completion_time(
+                    #     self.clients[cid], self.steps_by_client[cid],
+                    #     self.model_mb, cfg, timing_rng
+                    # )
+                    # print(f"Client {cid}: data_size={data_size}, estimated_time={client_times[cid]:.2f} sec")
 
                 # GDC: K-Means on cosine-normalised gradients (Section V-B)
                 cluster_start = time.perf_counter()
@@ -602,191 +606,115 @@ class EAFLRunner:
                         seed=cfg.seed + t,  # vary seed per round for diverse heads
                     )
                 )
+                del grads_list, data_sizes_list  # free memory
+                gc.collect()
                 clustering_time = time.perf_counter() - cluster_start
 
-                # ── First intra-cluster SAA (same round as clustering) ─────
-                # The gradients we just collected are reused here.
-                # Select fastest φ·|X_n| clients per cluster and run SAA.
-                cluster_updates    = []
-                all_participants   = set()
-                staleness_values   = []
-                cluster_summary    = {}
+                
+            # Select fastest φ·|X_n| clients per cluster and run SAA.
+            cluster_updates    = []
+            all_participants   = set()
+            staleness_values   = []
+            cluster_summary    = {}
+            completion_times_sel = {}
+            for cluster_id, members in cluster_members.items():
+                k = max(1, int(math.ceil(cfg.phi * len(members))))
+                member_times = {
+                    cid: estimate_completion_time(
+                        self.clients[cid], self.steps_by_client[cid],
+                        self.model_mb, cfg, timing_rng
+                    )
+                    for cid in members
+                }
+                
 
-                for cluster_id, members in cluster_members.items():
-                    k = max(1, int(math.ceil(cfg.phi * len(members))))
+                # Select fastest φ·|X_n| clients by completion time
+                # This is the paper's "fastest K clients" rule, applied
+                # at cluster level rather than globally.
+                selected = sorted(members, key=lambda c: member_times[c])[:k]
+                for cid in selected:
+                    completion_times_sel[cid] = member_times[cid]
+                print(f"Client {cid}: data_size={data_size}")
+                # head = cluster_heads[cluster_id]
+                # if head not in selected:
+                #     selected[-1] = head
+                #     selected = sorted(set(selected), key=lambda c: client_times[c])[:k]
+                
+                all_participants.update(selected)
+                
+                # Collect updates for SAA; gradients already computed above
+                member_updates = {}
+                for cid in members:
+                    model_round = max(0, last_received_round[cid])
+                    base_state = model_history.get(
+                        model_round,
+                        model_history[max(model_history.keys())]
+                    )
 
-                    # Select fastest φ·|X_n| clients by completion time
-                    # This is the paper's "fastest K clients" rule, applied
-                    # at cluster level rather than globally.
-                    selected = sorted(members, key=lambda c: client_times[c])[:k]
-                    # head = cluster_heads[cluster_id]
-                    # if head not in selected:
-                    #     selected[-1] = head
-                    #     selected = sorted(set(selected), key=lambda c: client_times[c])[:k]
-                    all_participants.update(selected)
+                    tmp_model = cfg.model_class(**cfg.model_args)
+                    tmp_model.load_state_dict(base_state)
 
-                    # Collect updates for SAA; gradients already computed above
-                    updates = []
-                    for cid in selected:
-                        model_round = max(0, last_received_round[cid])
-                        base_state = model_history.get(
-                            model_round,
-                            model_history[max(model_history.keys())]
-                        )
-
-                        tmp_model = cfg.model_class(**cfg.model_args)
-                        tmp_model.load_state_dict(base_state)
-
-                        _, grad, data_size = self.clients[cid].train(
-                            tmp_model, epochs=cfg.epochs, learning_rate=cfg.client_lr
-                        )
-                        tau = (t - last_participation_round[cid]
-                               if last_participation_round[cid] >= 0 else t + 1)
-                        print(f"Client {cid}: staleness={tau} round {t} last_participation_round={last_participation_round[cid]}")
-                        staleness_values.append(tau)
-                        updates.append({
-                            "grads":     grad,
-                            "data_size": data_size,
-                            "timestamp": last_participation_round[cid],
-                        })
-
-                    # SAA — Eq. 4
-                    print(f"SAA for cluster {cluster_id} with {len(selected)} participants...")
-                    
-                    g_bar = saa_cluster_gradient(updates, t)
-                    if g_bar is not None:
-                        cluster_updates.append({
-                            "gradient":          g_bar,
-                            # DSA uses FULL cluster data volume (Eq. 5), not
-                            # just the selected participants' volume
-                            "cluster_data_size": cluster_data_sizes[cluster_id],
-                        })
-
-                    cluster_summary[cluster_id] = {
-                        "head":     cluster_heads[cluster_id],
-                        "members":  sorted(members),
-                        "selected": sorted(selected),
+                    _, grad, data_size = self.clients[cid].train(
+                        tmp_model, epochs=cfg.epochs, learning_rate=cfg.client_lr
+                    )
+                    del tmp_model  # free memory
+                    gc.collect()
+                    member_updates[cid] = {
+                        "grad": grad,
+                        "data_size": data_size
                     }
+                    
+                updates=[]
+                for cid in selected:
+                    grad = member_updates[cid]["grad"]
+                    data_size = member_updates[cid]["data_size"]
 
-                # Simulate worst-case barrier time (slowest selected client)
-                if all_participants:
-                    barrier_time = max(client_times[c] for c in all_participants)
+                    tau = (t - last_participation_round[cid]
+                            if last_participation_round[cid] >= 0 else t + 1)
+                    print(f"Client {cid}: staleness={tau} round {t} last_participation_round={last_participation_round[cid]}")
+                    staleness_values.append(tau)
+                    updates.append({
+                        "grads":     grad,
+                        "data_size": data_size,
+                        "timestamp": last_participation_round[cid],
+                    })
+
+                # SAA — Eq. 4
+                print(f"SAA for cluster {cluster_id} with {len(selected)} participants...")
+                
+                g_bar = saa_cluster_gradient(updates, t)
+                if g_bar is not None:
+                    cluster_updates.append({
+                        "gradient":          g_bar,
+                        # DSA uses FULL cluster data volume (Eq. 5), not
+                        # just the selected participants' volume
+                        "cluster_data_size": cluster_data_sizes[cluster_id],
+                    })
+
+                cluster_summary[cluster_id] = {
+                    "head":     cluster_heads[cluster_id],
+                    "members":  sorted(members),
+                    "selected": sorted(selected),
+                }
+
+            # Simulate worst-case barrier time (slowest selected client)
+            if completion_times_sel:
+                barrier_time = max(completion_times_sel.values())
+                if is_clustering_round:
                     server_overhead = (cfg.server_aggregation_time_sec
-                                      + cfg.server_clustering_time_per_client_sec
-                                      * cfg.num_clients)
-                    simulated_round_time = barrier_time + server_overhead
+                                        + cfg.server_clustering_time_per_client_sec
+                                        * cfg.num_clients)
                 else:
-                    simulated_round_time = 0.0
+                    server_overhead = cfg.server_aggregation_time_sec
+                simulated_round_time = barrier_time + server_overhead
+            else:
+                simulated_round_time = 0.0
 
             # ──────────────────────────────────────────────────────────────
             # NON-CLUSTERING ROUND (Algorithm 1, lines 13-15 + client lines)
             # Use existing cluster assignments; run SAA per cluster, then DSA.
             # ──────────────────────────────────────────────────────────────
-            else:
-                cluster_updates  = []
-                all_participants = set()
-                staleness_values = []
-                cluster_summary  = {}
-
-                completion_times_sel = {}   # tracks wall-clock for barrier
-                print(f"\nNon-clustering round: {t}")
-                for cluster_id, members in cluster_members.items():
-                    k = max(1, int(math.ceil(cfg.phi * len(members))))
-
-                    # ── Estimate completion times for every member ─────────
-                    # A fresh per-round jitter draw ensures rankings are not
-                    # frozen; members with similar system_speed occasionally
-                    # swap positions, giving slow clients a chance to be selected.
-                    member_times = {
-                        cid: estimate_completion_time(
-                            self.clients[cid], self.steps_by_client[cid],
-                            self.model_mb, cfg, timing_rng
-                        )
-                        for cid in members
-                    }
-
-                    # rounds_since_participation = {
-                    #     cid: (t - last_participation_round[cid]) if last_participation_round[cid] >= 0 else t + 1
-                    #     for cid in members
-                    # }
-                    # staleness_bonus_weight = 0.3   # tune: 0.0 = pure speed, 1.0 = pure fairness
-                    # scores = {}
-                    # for cid in members:
-                    #     speed_score = 1.0 / max(member_times[cid], 1e-6)
-                    #     staleness_score = float(rounds_since_participation[cid])
-                    #     # normalize staleness within cluster
-                    #     max_stale = max(rounds_since_participation.values()) or 1
-                    #     scores[cid] = (1 - staleness_bonus_weight) * speed_score + \
-                    #                 staleness_bonus_weight * (staleness_score / max_stale)
-
-                    # ── Select fastest φ·|X_n| clients ────────────────────
-                    # Paper: "the cluster head aggregates local updates uploaded
-                    #         by clients within the cluster via staleness-aware
-                    #         aggregation" — semi-async means fastest-φ fraction
-                    #selected =sorted(members, key=lambda cid: -scores[cid])[:k] 
-                    selected= sorted(members, key=lambda c: member_times[c])[:k]
-                    # head = cluster_heads[cluster_id]
-                    # if head not in selected:
-                    #     selected[-1] = head
-                    #     selected = sorted(set(selected), key=lambda c: member_times[c])[:k]
-                    all_participants.update(selected)
-                    for cid in selected:
-                        completion_times_sel[cid] = member_times[cid]
-
-                    # ── Each selected client trains on its last-received model ──
-                    # This is what creates realistic staleness: slow clients who
-                    # haven't been selected for many rounds train on old models.
-                    updates = []
-                    for cid in selected:
-                        # Retrieve the model version this client last received
-                        print(f"Client {cid}: last_received_round={last_received_round[cid]}")
-                        model_round = max(0, last_received_round[cid])
-                        base_state  = model_history.get(
-                            model_round,
-                            model_history[max(model_history.keys())]
-                        )
-
-                        tmp_model = cfg.model_class(**cfg.model_args)
-                        tmp_model.load_state_dict(base_state)
-
-                        _, grad, data_size = self.clients[cid].train(
-                            tmp_model, epochs=cfg.epochs,
-                            learning_rate=cfg.client_lr
-                        )
-
-                        print(f"client {cid} last_participation_round={last_participation_round[cid]} current_round={t}")
-                        # τ_i = t - t'  (rounds since last participation)
-                        tau = (t - last_participation_round[cid]
-                               if last_participation_round[cid] >= 0 else t + 1)
-                        print(f"tau {tau}")
-                        staleness_values.append(tau)
-
-                        updates.append({
-                            "grads":     grad,
-                            "data_size": data_size,
-                            "timestamp": last_participation_round[cid],
-                        })
-
-                    # ── SAA (Eq. 4) ────────────────────────────────────────
-                    g_bar = saa_cluster_gradient(updates, t)
-                    if g_bar is not None:
-                        cluster_updates.append({
-                            "gradient":          g_bar,
-                            "cluster_data_size": cluster_data_sizes[cluster_id],
-                        })
-
-                    cluster_summary[cluster_id] = {
-                        "head":     cluster_heads[cluster_id],
-                        "members":  sorted(members),
-                        "selected": sorted(selected),
-                    }
-
-                # Wall-clock: slowest selected client across all clusters
-                if completion_times_sel:
-                    barrier_time         = max(completion_times_sel.values())
-                    simulated_round_time = barrier_time + cfg.server_aggregation_time_sec
-                else:
-                    simulated_round_time = 0.0
+            
 
             # ──────────────────────────────────────────────────────────────
             # DSA — Data size-aware Synchronous Inter-cluster Aggregation (Eq. 5)
