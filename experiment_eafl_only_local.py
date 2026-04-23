@@ -98,6 +98,7 @@ class Logger:
     def __init__(self, filename="eafl_only_local.txt"):
         self.terminal = sys.stdout
         self.log = open(filename, "w", encoding="utf-8")
+        print(f"[Logger] Writing to: {filename}")
 
     def write(self, message):
         self.terminal.write(message)
@@ -494,10 +495,10 @@ class EAFLRunner:
             raise ValueError(f"Unknown non_iid_type: {cfg.non_iid_type}")
 
         # ── Clients ────────────────────────────────────────────────────────
-        print(f"\n--- Client Information ({cfg.num_clients} Total) ---")
-        for i in range(cfg.num_clients):
-            print(f"Client {i}: {len(client_indices[i])} samples")
-        print("--------------------------------------\n")
+        # print(f"\n--- Client Information ({cfg.num_clients} Total) ---")
+        # for i in range(cfg.num_clients):
+        #     print(f"Client {i}: {len(client_indices[i])} samples")
+        # print("--------------------------------------\n")
         
         self.clients = create_clients(trainset, client_indices, self.device, cfg)
         print(f"Created {len(self.clients)} clients  "
@@ -519,7 +520,7 @@ class EAFLRunner:
             cid: estimate_steps(self.clients[cid], cfg.epochs, cfg.local_batch_size)
             for cid in range(cfg.num_clients)
         }
-        print(f"Steps by client: {self.steps_by_client}\n")
+        # print(f"Steps by client: {self.steps_by_client}\n")
         self.model_mb = model_size_mb(self.server.global_model.state_dict())
 
         # ── Logger ─────────────────────────────────────────────────────────
@@ -589,7 +590,7 @@ class EAFLRunner:
             clustering_time = 0.0
 
             if is_clustering_round:
-                print(f"\nClustering round: {t}")
+                # print(f"\nClustering round: {t}")
                 grads_list      = []
                 data_sizes_list = []
                 client_times    = {}   # for selecting fastest-φ after clustering
@@ -604,11 +605,11 @@ class EAFLRunner:
                         client_local_states[cid] = clone_state(
                             self.server.global_model.state_dict()
                         )
-                        print(f"Clustering t=0: client {cid} seeded from initial global model")
+                        # print(f"Clustering t=0: client {cid} seeded from initial global model")
 
                     tmp_model = cfg.model_class(**cfg.model_args)
                     tmp_model.load_state_dict(client_local_states[cid])
-                    print(f"Clustering: client {cid} training from local state")
+                    # print(f"Clustering: client {cid} training from local state")
 
                     # train() returns (state_dict, pseudo_gradient, data_size)
                     trained_state, grad, data_size = self.clients[cid].train(
@@ -728,8 +729,8 @@ class EAFLRunner:
 
                     tau = (t - last_participation_round[cid]
                            if last_participation_round[cid] >= 0 else t + 1)
-                    print(f"Client {cid}: staleness={tau} round {t} "
-                          f"last_participation_round={last_participation_round[cid]}")
+                    # print(f"Client {cid}: staleness={tau} round {t} "
+                    #       f"last_participation_round={last_participation_round[cid]}")
                     staleness_values.append(tau)
                     updates.append({
                         "grads":     grad,
@@ -738,7 +739,7 @@ class EAFLRunner:
                     })
 
                 # SAA — Eq. 4
-                print(f"SAA for cluster {cluster_id} with {len(selected)} participants...")
+                # print(f"SAA for cluster {cluster_id} with {len(selected)} participants...")
                 
                 g_bar = saa_cluster_gradient(updates, t)
                 if g_bar is not None:
@@ -792,7 +793,7 @@ class EAFLRunner:
                 last_participation_round[cid] = t   # τ reset for next round
                 # Overwrite local state with the fresh global model
                 client_local_states[cid] = clone_state(new_state)
-                print(f"Participant {cid} updated to new global model after round {t}")
+                # print(f"Participant {cid} updated to new global model after round {t}")
 
             # At t=0, first_round_grads has served its purpose — free memory.
             if t == 0:
@@ -900,6 +901,8 @@ if __name__ == "__main__":
     config.seed = args.seed
     if args.rounds is not None:
         config.rounds = args.rounds
+    log_filename = f"eafl_{config.dataset_name}_{config.non_iid_type}_r{config.rounds}_s{config.seed}.txt"
+    sys.stdout = Logger(log_filename)
 
     results = run(config)
     print(json.dumps(results, indent=2))
