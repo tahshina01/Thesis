@@ -81,13 +81,18 @@ def split_non_iid_t1(dataset, num_clients: int, epsilon: float = 0.04) -> list:
          fashion and allocates the rest (1-ε)-proportion in a sort-and-partition
          fashion."
 
-    Concretely:
-      1. For each class, randomly assign ε fraction of its samples uniformly
-         across ALL clients (IID part).
-      2. Sort the remaining (1-ε) fraction by class label, then partition into
-         num_clients consecutive blocks (sort-and-partition part).  This ensures
-         each client's non-IID portion is dominated by at most 1-2 classes,
-         depending on class sizes and num_clients.
+    Correct implementation:
+      1. IID part (ε fraction):
+         For each class, randomly select ε of its samples and distribute them
+         uniformly across all clients in round-robin order.
+
+      2. Non-IID part ((1-ε) fraction):
+         Collect ALL remaining samples from ALL classes into one pool and sort
+         them globally by class label.  Then partition that sorted array into
+         num_clients consecutive equal-sized blocks.  Because the array is
+         sorted by label, each block falls in a region dominated by at most
+         1-2 class boundaries, giving each client a strongly skewed label
+         distribution.  This is the correct meaning of "sort-and-partition".
 
     Parameters
     ----------
@@ -101,40 +106,44 @@ def split_non_iid_t1(dataset, num_clients: int, epsilon: float = 0.04) -> list:
     """
     assert 0.0 <= epsilon <= 1.0, "epsilon must be in [0, 1]"
 
-    targets    = np.array(dataset.targets)
+    targets     = np.array(dataset.targets)
     num_classes = int(targets.max()) + 1
     all_indices = np.arange(len(targets))
 
     rng = np.random.default_rng(42)    # fixed seed for reproducibility
 
     client_indices = [[] for _ in range(num_clients)]
+    non_iid_pool   = []   # accumulates remaining indices across all classes
 
+    # ── Step 1: IID part ──────────────────────────────────────────────────────
+    # For each class: randomly pick ε fraction and distribute uniformly across
+    # all clients in round-robin order.  The remaining samples go into the pool.
     for c in range(num_classes):
-        class_idx = all_indices[targets == c]
+        class_idx = all_indices[targets == c].copy()
         rng.shuffle(class_idx)
 
-        n_class   = len(class_idx)
-        n_iid     = max(0, int(round(epsilon * n_class)))
-        n_non_iid = n_class - n_iid
+        n_iid = max(0, int(round(epsilon * len(class_idx))))
 
-        # ── IID part ──────────────────────────────────────────────────────
-        # Distribute uniformly at random across all clients
         if n_iid > 0:
-            iid_idx = class_idx[:n_iid]
-            for i, sample_idx in enumerate(iid_idx):
+            for i, sample_idx in enumerate(class_idx[:n_iid]):
                 client_indices[i % num_clients].append(int(sample_idx))
 
-        # ── Non-IID part: sort-and-partition ──────────────────────────────
-        # Samples are already sorted by class (all c), so we just partition
-        # the block into num_clients consecutive pieces.
-        if n_non_iid > 0:
-            non_iid_idx = class_idx[n_iid:]
-            # Split into num_clients chunks; last chunk may differ in size
-            chunks = np.array_split(non_iid_idx, num_clients)
-            for i, chunk in enumerate(chunks):
-                client_indices[i].extend(chunk.tolist())
+        non_iid_pool.extend(class_idx[n_iid:].tolist())
 
-    # Shuffle each client's index list so class ordering within a client is random
+    # ── Step 2: Non-IID part — sort globally by label, then partition ─────────
+    # Sort the entire pool by class label so the array looks like:
+    #   [all class-0 samples | all class-1 samples | ... | all class-9 samples]
+    # Splitting this into num_clients equal consecutive blocks means each client
+    # receives samples from at most 1-2 classes — strong Non-IID.
+    non_iid_pool = np.array(non_iid_pool)
+    non_iid_pool = non_iid_pool[np.argsort(targets[non_iid_pool])]
+
+    chunks = np.array_split(non_iid_pool, num_clients)
+    for i, chunk in enumerate(chunks):
+        client_indices[i].extend(chunk.tolist())
+
+    # Shuffle each client's final index list so label order does not bleed
+    # into mini-batch ordering during training.
     for i in range(num_clients):
         arr = np.array(client_indices[i])
         rng.shuffle(arr)
@@ -148,35 +157,35 @@ def split_non_iid_t1(dataset, num_clients: int, epsilon: float = 0.04) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_non_iid_t2(dataset, num_clients: int,
-                     num_labels_per_client: int = 1,
-                     size_alpha: float = 0.5,
-                     min_samples_per_client: int = 10) -> list:
+                     num_labels_per_client: int = 1) -> list:
     """
     T2 Non-IID split — paper Section VI-A:
         "In the second type (T2), each client is only assigned data samples from
          a fixed L_num kinds of labels."
 
-    For the paper's hardest setting (L_num=1, CIFAR-10, M=100):
-      - 10 classes × (100 / 10) = 10 clients per class
-      - Each client holds data from exactly 1 label
+    Paper-faithful implementation:
+      - Partition the num_clients clients into groups, one group per class.
+        Each class is assigned exactly (num_clients * L_num // num_classes)
+        clients.
+      - Each assigned client receives an equal share of that class's samples.
+        The paper specifies only label restriction, not quantity imbalance,
+        so equal splitting is the correct faithful default.
+      - A single seeded RNG is used throughout for full reproducibility.
 
-    Within each class, samples are distributed unevenly across its clients
-    using a Dirichlet(size_alpha) draw, adding quantity heterogeneity on top
-    of the label-based heterogeneity.  This is a common extension used in
-    follow-up FL papers to make the benchmark more realistic.
+    For the paper's hardest setting (L_num=1, M=100, 10 classes):
+      - clients_per_class = 100 * 1 // 10 = 10
+      - Each client gets data from exactly 1 label
+      - Each client gets ~1/10 of that class's samples
 
     Parameters
     ----------
-    dataset                : torchvision dataset with .targets
-    num_clients            : M (paper: 100)
-    num_labels_per_client  : L_num (paper: 1 for hardest setting)
-    size_alpha             : Dirichlet concentration for within-class size
-                             imbalance.  Smaller → more unequal sizes.
-    min_samples_per_client : soft floor so no client gets 0 samples
+    dataset               : torchvision dataset with .targets attribute
+    num_clients           : M (paper: 100)
+    num_labels_per_client : L_num (paper: 1 for hardest setting)
 
     Returns
     -------
-    client_indices : list of lists
+    client_indices : list of lists, client_indices[i] = sample indices for client i
     """
     if hasattr(dataset, "targets"):
         targets = np.array(dataset.targets)
@@ -186,49 +195,51 @@ def split_non_iid_t2(dataset, num_clients: int,
         raise ValueError("split_non_iid_t2: dataset must have a .targets attribute")
 
     num_classes = int(targets.max()) + 1
-    class_indices = [np.where(targets == c)[0] for c in range(num_classes)]
+    rng = np.random.default_rng(42)   # single RNG for full reproducibility
 
-    rng = np.random.default_rng(42)
-
-    client_indices = [[] for _ in range(num_clients)]
-
-    # Number of clients that receive data from each class
+    # clients_per_class: how many clients are assigned to each class
     clients_per_class = (num_clients * num_labels_per_client) // num_classes
     if clients_per_class <= 0:
         raise ValueError(
-            f"clients_per_class = {clients_per_class} ≤ 0.  "
+            f"clients_per_class = {clients_per_class} ≤ 0. "
             f"Increase num_labels_per_client or reduce num_clients."
         )
 
+    # Build a shuffled assignment: class c → client IDs [c*cpc .. (c+1)*cpc)
+    # We shuffle a list of all client IDs first so the mapping is random
+    # rather than always assigning clients 0-9 to class 0, etc.
+    all_client_ids = np.arange(num_clients)
+    rng.shuffle(all_client_ids)
+
+    # Detect collisions: if L_num > 1, the same client could be assigned to
+    # two different classes.  Raise early rather than silently violating the
+    # L_num constraint.
+    total_slots = clients_per_class * num_classes
+    if total_slots > num_clients:
+        raise ValueError(
+            f"num_labels_per_client={num_labels_per_client} causes "
+            f"{total_slots} assignment slots for {num_clients} clients — "
+            f"some clients would receive more than L_num label types. "
+            f"Reduce num_labels_per_client or increase num_clients."
+        )
+
+    client_indices = [[] for _ in range(num_clients)]
+
     for c in range(num_classes):
-        idx = class_indices[c].copy()
-        rng.shuffle(idx)
-        n = len(idx)
+        # Clients assigned to class c
+        assigned = all_client_ids[c * clients_per_class : (c + 1) * clients_per_class]
 
-        # Round-robin assignment: class c → clients [c*cpc, (c+1)*cpc) mod M
-        assigned = [(c * clients_per_class + k) % num_clients
-                    for k in range(clients_per_class)]
+        # All samples of class c, shuffled for random per-client allocation
+        class_idx = np.where(targets == c)[0].copy()
+        rng.shuffle(class_idx)
 
-        if n == 0:
-            continue
+        # Equal split: np.array_split handles non-divisible sizes gracefully
+        chunks = np.array_split(class_idx, clients_per_class)
+        for client_id, chunk in zip(assigned, chunks):
+            client_indices[client_id].extend(chunk.tolist())
 
-        # Unequal sample counts via Dirichlet
-        proportions = rng.dirichlet([size_alpha] * clients_per_class)
-
-        if min_samples_per_client * clients_per_class < n:
-            base      = np.full(clients_per_class, min_samples_per_client, dtype=int)
-            remaining = n - base.sum()
-            counts    = base + np.random.multinomial(remaining, proportions)
-        else:
-            counts = np.random.multinomial(n, proportions)
-
-        start = 0
-        for client_id, count in zip(assigned, counts):
-            end = start + count
-            if count > 0:
-                client_indices[client_id].extend(idx[start:end].tolist())
-            start = end
-
+    # Shuffle each client's index list so label order does not bleed into
+    # mini-batch ordering during training.
     for i in range(num_clients):
         arr = np.array(client_indices[i])
         rng.shuffle(arr)

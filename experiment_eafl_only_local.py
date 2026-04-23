@@ -495,10 +495,10 @@ class EAFLRunner:
             raise ValueError(f"Unknown non_iid_type: {cfg.non_iid_type}")
 
         # ── Clients ────────────────────────────────────────────────────────
-        # print(f"\n--- Client Information ({cfg.num_clients} Total) ---")
-        # for i in range(cfg.num_clients):
-        #     print(f"Client {i}: {len(client_indices[i])} samples")
-        # print("--------------------------------------\n")
+        print(f"\n--- Client Information ({cfg.num_clients} Total) ---")
+        for i in range(cfg.num_clients):
+            print(f"Client {i}: {len(client_indices[i])} samples")
+        print("--------------------------------------\n")
         
         self.clients = create_clients(trainset, client_indices, self.device, cfg)
         print(f"Created {len(self.clients)} clients  "
